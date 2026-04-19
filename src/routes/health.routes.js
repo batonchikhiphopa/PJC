@@ -9,7 +9,14 @@ router.get("/", (req, res) => {
   });
 });
 router.get("/db", async (req, res) => {
-  const users = await prisma.user.findMany();
+  const users = await prisma.user.findMany({
+    select: {
+      id: true,
+      email: true,
+      createdAt: true,
+      updatedAt: true,
+    },
+  });
 
   res.json(users);
 });
