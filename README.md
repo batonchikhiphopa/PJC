@@ -83,6 +83,26 @@ npm start
 
 By default, the API runs on `http://localhost:5000`.
 
+## Frontend
+
+The Express server also serves the static frontend from:
+
+```text
+http://localhost:5000/client/
+```
+
+Local startup order:
+
+```bash
+npm install
+npm run db:up
+npm run prisma:migrate
+npm run prisma:generate
+npm run dev
+```
+
+Open `http://localhost:5000/client/` after the server starts. The UI supports sign in and account creation. New accounts are created through the existing `POST /users` API, then the frontend signs in with `POST /auth/login`.
+
 ## Endpoints
 
 Most endpoints require `Authorization: Bearer <token>` after login.
