@@ -10,23 +10,67 @@ datasource db {
   provider = "postgresql"
 }
 
+enum ApplicationStatus {
+  wishlist
+  applied
+  interview
+  test_task
+  offer
+  rejected
+  ghosted
+}
+
 model User {
-  id        Int      @id @default(autoincrement())
-  email     String   @unique
-  password  String
-  createdAt DateTime @default(now())
-  updatedAt DateTime @updatedAt
-  companies Company[]
+  id           Int           @id @default(autoincrement())
+  email        String        @unique
+  password     String
+  createdAt    DateTime      @default(now())
+  updatedAt    DateTime      @updatedAt
+  companies    Company[]
+  applications Application[]
+  notes        Note[]
 }
 
 model Company {
-  id        Int      @id @default(autoincrement())
-  name      String
-  website   String?
-  location  String?
-  createdAt DateTime @default(now())
-  updatedAt DateTime @updatedAt
+  id           Int           @id @default(autoincrement())
+  name         String
+  website      String?
+  location     String?
+  createdAt    DateTime      @default(now())
+  updatedAt    DateTime      @updatedAt
+  applications Application[]
 
-  userId    Int
-  user      User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  userId       Int
+  user         User          @relation(fields: [userId], references: [id], onDelete: Cascade)
+}
+
+model Application {
+  id         Int               @id @default(autoincrement())
+  title      String
+  status     ApplicationStatus @default(wishlist)
+  jobUrl     String?
+  salary     String?
+  appliedAt  DateTime?
+  createdAt  DateTime          @default(now())
+  updatedAt  DateTime          @updatedAt
+  notes      Note[]
+
+  userId     Int
+  user       User              @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  companyId  Int
+  company    Company           @relation(fields: [companyId], references: [id], onDelete: Cascade)
+}
+
+model Note {
+  id            Int         @id @default(autoincrement())
+  content       String
+  createdAt     DateTime    @default(now())
+  updatedAt     DateTime    @updatedAt
+
+  userId        Int
+  user          User        @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  applicationId Int
+  application   Application @relation(fields: [applicationId], references: [id], onDelete: Cascade)
 }

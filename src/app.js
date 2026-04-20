@@ -3,6 +3,8 @@ import healthRoutes from "./routes/health.routes.js";
 import userRoutes from "./routes/users.routes.js";
 import authRoutes from "./routes/auth.routes.js";
 import companyRoutes from "./routes/companies.routes.js";
+import applicationRoutes from "./routes/applications.routes.js";
+import noteRoutes from "./routes/notes.routes.js";
 
 const app = express();
 
@@ -12,5 +14,12 @@ app.use("/health", healthRoutes);
 app.use("/auth", authRoutes);
 app.use("/users", userRoutes);
 app.use("/companies", companyRoutes);
+app.use("/applications", applicationRoutes);
+app.use("/notes", noteRoutes);
+app.use((req, res) => {
+  return res.status(404).json({
+    error: "Route not found",
+  });
+});
 
 export default app;
