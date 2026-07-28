@@ -10,3 +10,4 @@ export const state = {
 export function setUser(u) { state.user = u; }
 export function setCompanies(list) { state.companies = list; }
 export function setPage(p) { state.currentPage = p; }
+export function setDetailApplication(id) { state.detailApplicationId = id; }

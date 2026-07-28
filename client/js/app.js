@@ -2,15 +2,35 @@
 
 import { checkSession, initLoginScreen, logout } from './auth.js';
 import { companies as companiesApi, applications as appsApi, notes as notesApi } from './api.js';
-import { state, setCompanies } from './state.js';
 import {
-  el, showEl, hideEl, setHtml, openModal, closeModal,
-  statusBadge, formatDate, showLoading, showDetailPanel, hideDetailPanel,
+  state,
+  setCompanies,
+  setDetailApplication,
+  setPage,
+} from './state.js';
+import {
+  el, showEl, setHtml, openModal, closeModal,
+  statusBadge, formatDate, formatDateTime, toDateTimeLocalValue,
+  showLoading, showDetailPanel, hideDetailPanel,
   alertError, escapeHtml, escapeAttr, safeExternalUrl, statusLabel,
+  clearFormErrors, confirmAction, showFormErrors, showToast,
   STATUS_COLORS, ALL_STATUSES
 } from './ui.js';
 
 let applicationsCompanyLoadError = '';
+let appHasStarted = false;
+let appEventsBound = false;
+let searchTimer = null;
+
+const PAGE_ROUTES = {
+  dashboard: '/app/dashboard',
+  applications: '/app/applications',
+  companies: '/app/companies',
+};
+
+window.addEventListener('pjc:unauthorized', () => {
+  if (appHasStarted) window.location.reload();
+});
 
 function getErrorMessage(err, fallback = 'Something went wrong') {
   return err?.message || fallback;
@@ -29,6 +49,77 @@ function renderWebsite(value) {
   return renderExternalLink(value, value) || `<span>${escapeHtml(value)}</span>`;
 }
 
+function actionTiming(value) {
+  if (!value) {
+    return { label: 'No deadline', tone: 'unscheduled' };
+  }
+
+  const deadline = new Date(value);
+  if (Number.isNaN(deadline.getTime())) {
+    return { label: 'No deadline', tone: 'unscheduled' };
+  }
+
+  const now = new Date();
+  const startOfToday = new Date(now.getFullYear(), now.getMonth(), now.getDate());
+  const startOfTomorrow = new Date(startOfToday);
+  startOfTomorrow.setDate(startOfTomorrow.getDate() + 1);
+
+  if (deadline < now) {
+    return { label: `Overdue · ${formatDateTime(value)}`, tone: 'overdue' };
+  }
+
+  if (deadline < startOfTomorrow) {
+    return { label: `Today · ${formatDateTime(value)}`, tone: 'today' };
+  }
+
+  return { label: formatDateTime(value), tone: 'upcoming' };
+}
+
+function refreshCurrentPage() {
+  if (state.detailApplicationId) {
+    return openApplicationDetail(state.detailApplicationId, { historyMode: 'none' });
+  }
+  if (state.currentPage === 'dashboard') return loadDashboard();
+  if (state.currentPage === 'applications') return loadApplicationsPage();
+  if (state.currentPage === 'companies') return loadCompaniesPage();
+}
+
+function writeHistory(url, mode, stateData = {}) {
+  if (mode === 'none') return;
+  if (mode === 'replace') {
+    window.history.replaceState(stateData, '', url);
+  } else {
+    window.history.pushState(stateData, '', url);
+  }
+}
+
+async function renderCurrentRoute() {
+  const detailMatch = window.location.pathname.match(/^\/app\/applications\/([1-9]\d*)$/);
+  if (detailMatch) {
+    await navigateTo('applications', { historyMode: 'none' });
+    await openApplicationDetail(Number(detailMatch[1]), { historyMode: 'none' });
+    return;
+  }
+
+  const page = Object.entries(PAGE_ROUTES)
+    .find(([, route]) => route === window.location.pathname)?.[0];
+
+  if (page) {
+    await navigateTo(page, { historyMode: 'none' });
+    return;
+  }
+
+  await navigateTo('dashboard', { historyMode: 'replace' });
+}
+
+function closeDetailRoute() {
+  if (window.history.state?.returnUrl) {
+    window.history.back();
+  } else {
+    navigateTo('applications', { historyMode: 'replace' });
+  }
+}
+
 // ===== BOOT =====
 async function boot() {
   const user = await checkSession();
@@ -41,41 +132,63 @@ async function boot() {
 }
 
 function startApp(user) {
+  appHasStarted = true;
   showEl('app');
   el('sidebar-email').textContent = user.email;
 
-  // Nav
-  document.querySelectorAll('.nav-item').forEach(link => {
-    link.addEventListener('click', e => {
-      e.preventDefault();
-      navigateTo(link.dataset.page);
+  if (!appEventsBound) {
+    appEventsBound = true;
+    document.querySelectorAll('.nav-item').forEach(link => {
+      link.addEventListener('click', event => {
+        if (
+          event.button !== 0 ||
+          event.metaKey ||
+          event.ctrlKey ||
+          event.shiftKey ||
+          event.altKey
+        ) {
+          return;
+        }
+        event.preventDefault();
+        navigateTo(link.dataset.page);
+      });
     });
-  });
 
-  el('logout-btn').addEventListener('click', logout);
-  el('modal-close').addEventListener('click', closeModal);
-  el('modal-overlay').addEventListener('click', e => {
-    if (e.target === el('modal-overlay')) closeModal();
-  });
-  el('detail-close').addEventListener('click', hideDetailPanel);
+    el('logout-btn').addEventListener('click', logout);
+    el('modal-close').addEventListener('click', closeModal);
+    el('modal-overlay').addEventListener('click', event => {
+      if (event.target === el('modal-overlay')) closeModal();
+    });
+    el('detail-close').addEventListener('click', closeDetailRoute);
+    window.addEventListener('popstate', renderCurrentRoute);
+  }
 
-  // Initial page
-  navigateTo('dashboard');
+  renderCurrentRoute();
 }
 
-function navigateTo(page) {
+async function navigateTo(page, { historyMode = 'push' } = {}) {
+  const route = PAGE_ROUTES[page] || PAGE_ROUTES.dashboard;
+  writeHistory(route, historyMode);
+  setPage(page);
+  setDetailApplication(null);
   document.querySelectorAll('.nav-item').forEach(l => l.classList.remove('active'));
   const link = document.querySelector(`.nav-item[data-page="${page}"]`);
-  if (link) link.classList.add('active');
+  if (link) {
+    link.classList.add('active');
+    link.setAttribute('aria-current', 'page');
+  }
+  document.querySelectorAll('.nav-item:not(.active)').forEach(item => {
+    item.removeAttribute('aria-current');
+  });
 
   document.querySelectorAll('.page').forEach(p => p.classList.remove('active'));
   el(`page-${page}`).classList.add('active');
 
   hideDetailPanel();
 
-  if (page === 'dashboard') loadDashboard();
-  if (page === 'applications') loadApplicationsPage();
-  if (page === 'companies') loadCompaniesPage();
+  if (page === 'dashboard') return loadDashboard();
+  if (page === 'applications') return loadApplicationsPage();
+  if (page === 'companies') return loadCompaniesPage();
 }
 
 // ===== DASHBOARD =====
@@ -94,8 +207,18 @@ function renderDashboard(data) {
   const counts = data.countsByStatus || {};
   const perCompany = Array.isArray(data.applicationsPerCompany) ? data.applicationsPerCompany : [];
   const recent = Array.isArray(data.recentApplications) ? data.recentApplications : [];
+  const nextActions = Array.isArray(data.nextActions) ? data.nextActions : [];
+  const nextActionCount = Number(data.nextActionCount ?? nextActions.length);
+  const actionSummary = nextActions.reduce((summary, item) => {
+    const timing = actionTiming(item.nextActionAt);
+    if (timing.tone === 'overdue') summary.overdue += 1;
+    if (timing.tone === 'today') summary.today += 1;
+    if (timing.tone === 'unscheduled') summary.unscheduled += 1;
+    return summary;
+  }, { overdue: 0, today: 0, unscheduled: 0 });
+  actionSummary.overdue = Number(data.overdueActionCount ?? actionSummary.overdue);
+  actionSummary.unscheduled = Number(data.unscheduledActionCount ?? actionSummary.unscheduled);
 
-  // Stats cards
   let statsHtml = `<div class="stats-grid">
     <div class="stat-card"><div class="stat-label">Total</div><div class="stat-value">${total}</div></div>`;
   for (const s of ALL_STATUSES) {
@@ -109,7 +232,6 @@ function renderDashboard(data) {
   }
   statsHtml += '</div>';
 
-  // Status bars
   let barsHtml = ALL_STATUSES.map(s => {
     const count = Number(counts[s] || 0);
     const pct = total > 0 ? Math.round((count / total) * 100) : 0;
@@ -122,7 +244,6 @@ function renderDashboard(data) {
     </div>`;
   }).join('');
 
-  // Per company
   let companyHtml = perCompany.length === 0
     ? '<div style="color:var(--text2);font-size:13px">No data yet</div>'
     : perCompany.map(c => `
@@ -131,22 +252,58 @@ function renderDashboard(data) {
         <span class="company-count">${Number(c.count || 0)}</span>
       </div>`).join('');
 
-  // Recent apps
   let recentHtml = recent.length === 0
     ? '<div style="color:var(--text2);font-size:13px;padding:12px 0">No applications yet</div>'
     : `<div class="table-wrap"><table>
         <thead><tr><th>Title</th><th>Company</th><th>Status</th><th>Applied</th></tr></thead>
         <tbody>${recent.map(a => `
-          <tr data-id="${escapeAttr(a.id)}" class="app-row-click">
-            <td>${escapeHtml(a.title)}</td>
-            <td>${escapeHtml(a.company?.name || '-')}</td>
-            <td>${statusBadge(a.status || 'wishlist')}</td>
-            <td>${formatDate(a.appliedAt || a.createdAt)}</td>
+          <tr data-id="${escapeAttr(a.id)}" class="app-row-click" tabindex="0" role="link" aria-label="Open ${escapeAttr(a.title)}">
+            <td data-label="Title">${escapeHtml(a.title)}</td>
+            <td data-label="Company">${escapeHtml(a.company?.name || '-')}</td>
+            <td data-label="Status">${statusBadge(a.status || 'wishlist')}</td>
+            <td data-label="Applied">${formatDate(a.appliedAt || a.createdAt)}</td>
           </tr>`).join('')}
         </tbody>
       </table></div>`;
 
+  const nextActionsHtml = nextActions.length === 0
+    ? `<div class="empty-state compact">
+        <strong>No next actions planned</strong>
+        Add a next action and deadline to an application to build your daily queue.
+      </div>`
+    : `<div class="action-list">${nextActions.map(item => {
+        const timing = actionTiming(item.nextActionAt);
+        return `
+          <button class="action-item app-row-click" data-id="${escapeAttr(item.id)}">
+            <span class="action-state action-state-${escapeAttr(timing.tone)}"></span>
+            <span class="action-content">
+              <strong>${escapeHtml(item.nextAction)}</strong>
+              <span>${escapeHtml(item.title)} · ${escapeHtml(item.company?.name || '-')}</span>
+            </span>
+            <span class="action-deadline action-deadline-${escapeAttr(timing.tone)}">${escapeHtml(timing.label)}</span>
+          </button>`;
+      }).join('')}</div>`;
+
   setHtml('dashboard-content', `
+    <div class="workflow-summary">
+      <div>
+        <span class="workflow-eyebrow">Your queue</span>
+        <h3>${actionSummary.overdue > 0
+          ? `${actionSummary.overdue} overdue action${actionSummary.overdue === 1 ? '' : 's'}`
+          : actionSummary.today > 0
+            ? `${actionSummary.today} action${actionSummary.today === 1 ? '' : 's'} due today`
+            : 'You are on track'}</h3>
+        <p>${nextActionCount} active next action${nextActionCount === 1 ? '' : 's'} · ${actionSummary.unscheduled} without a deadline</p>
+      </div>
+      <button class="btn btn-primary" id="dashboard-new-application">+ New Application</button>
+    </div>
+    <div class="section-card action-section">
+      <div class="section-heading">
+        <h4>Next Actions</h4>
+        <span>${nextActionCount} planned</span>
+      </div>
+      ${nextActionsHtml}
+    </div>
     ${statsHtml}
     <div class="dashboard-grid">
       <div class="section-card">
@@ -164,9 +321,29 @@ function renderDashboard(data) {
     </div>
   `);
 
-  // Clicking a recent app row opens detail
+  el('dashboard-new-application').onclick = async () => {
+    try {
+      const list = await companiesApi.list();
+      setCompanies(list);
+      applicationsCompanyLoadError = '';
+      openApplicationForm(null);
+    } catch (err) {
+      setCompanies([]);
+      applicationsCompanyLoadError = getErrorMessage(err, 'Companies could not be loaded');
+      openApplicationForm(null);
+    }
+  };
+
   document.querySelectorAll('.app-row-click').forEach(row => {
     row.addEventListener('click', () => openApplicationDetail(Number(row.dataset.id)));
+    if (row.tagName !== 'BUTTON') {
+      row.addEventListener('keydown', event => {
+        if (event.key === 'Enter' || event.key === ' ') {
+          event.preventDefault();
+          openApplicationDetail(Number(row.dataset.id));
+        }
+      });
+    }
   });
 }
 
@@ -191,6 +368,7 @@ function renderCompaniesList(list) {
   }
 
   setHtml('companies-list', list.map(c => {
+    const applicationCount = Number(c._count?.applications || 0);
     const websiteHtml = renderWebsite(c.website);
     const locationHtml = c.location ? `<span>${escapeHtml(c.location)}</span>` : '';
     const detailsHtml = websiteHtml || locationHtml
@@ -203,11 +381,15 @@ function renderCompaniesList(list) {
         <div class="company-card-name">${escapeHtml(c.name)}</div>
         <div class="company-card-meta">
           ${detailsHtml}
+          <span>${applicationCount} application${applicationCount === 1 ? '' : 's'}</span>
         </div>
       </div>
       <div class="company-card-actions">
         <button class="btn btn-ghost btn-edit-company" data-id="${escapeAttr(c.id)}">Edit</button>
-        <button class="btn btn-danger btn-delete-company" data-id="${escapeAttr(c.id)}">Delete</button>
+        <button class="btn btn-danger btn-delete-company" data-id="${escapeAttr(c.id)}"
+          ${applicationCount > 0 ? 'disabled title="Remove all applications before deleting this company"' : ''}>
+          Delete
+        </button>
       </div>
     </div>`;
   }).join(''));
@@ -220,16 +402,20 @@ function renderCompaniesList(list) {
   });
 
   document.querySelectorAll('.btn-delete-company').forEach(btn => {
-    btn.addEventListener('click', () => deleteCompany(Number(btn.dataset.id)));
+    btn.addEventListener('click', () => {
+      const company = list.find(c => c.id === Number(btn.dataset.id));
+      deleteCompany(company);
+    });
   });
 }
 
 function openCompanyForm(company) {
   const isEdit = !!company;
   openModal(isEdit ? 'Edit Company' : 'New Company', `
-    <div class="field"><label>Name *</label><input id="co-name" type="text" value="${isEdit ? escapeAttr(company.name) : ''}" /></div>
-    <div class="field"><label>Website</label><input id="co-website" type="url" value="${isEdit && company.website ? escapeAttr(company.website) : ''}" placeholder="https://" /></div>
-    <div class="field"><label>Location</label><input id="co-location" type="text" value="${isEdit && company.location ? escapeAttr(company.location) : ''}" /></div>
+    <div id="co-form-error" class="alert alert-error hidden" role="alert"></div>
+    <div class="field"><label for="co-name">Name *</label><input id="co-name" type="text" value="${isEdit ? escapeAttr(company.name) : ''}" /></div>
+    <div class="field"><label for="co-website">Website</label><input id="co-website" type="url" value="${isEdit && company.website ? escapeAttr(company.website) : ''}" placeholder="https://" /></div>
+    <div class="field"><label for="co-location">Location</label><input id="co-location" type="text" value="${isEdit && company.location ? escapeAttr(company.location) : ''}" /></div>
     <div class="form-actions">
       <button class="btn btn-secondary" id="co-cancel">Cancel</button>
       <button class="btn btn-primary" id="co-save">${isEdit ? 'Save Changes' : 'Create Company'}</button>
@@ -237,21 +423,34 @@ function openCompanyForm(company) {
   `);
 
   el('co-cancel').onclick = closeModal;
-  el('co-save').onclick = async () => {
+  const companySaveButton = el('co-save');
+  companySaveButton.onclick = async () => {
     const name = el('co-name').value.trim();
     const website = el('co-website').value.trim();
     const location = el('co-location').value.trim();
-    if (!name) { alert('Company name is required'); return; }
+    clearFormErrors();
+    if (!name) {
+      showFormErrors(
+        { message: 'Company name is required', details: [{ field: 'body.name', message: 'Company name is required' }] },
+        { errorId: 'co-form-error', fieldMap: { 'body.name': 'co-name' } },
+      );
+      return;
+    }
     if (website && !safeExternalUrl(website)) {
-      alert('Website must start with http:// or https://');
+      showFormErrors(
+        { message: 'Website is invalid', details: [{ field: 'body.website', message: 'Website must start with http:// or https://' }] },
+        { errorId: 'co-form-error', fieldMap: { 'body.website': 'co-website' } },
+      );
       return;
     }
 
-    el('co-save').disabled = true;
+    companySaveButton.disabled = true;
     try {
-      const payload = { name };
-      if (website) payload.website = website;
-      if (location) payload.location = location;
+      const payload = {
+        name,
+        website: website || null,
+        location: location || null,
+      };
 
       if (isEdit) {
         await companiesApi.update(company.id, payload);
@@ -259,22 +458,41 @@ function openCompanyForm(company) {
         await companiesApi.create(payload);
       }
       closeModal();
-      loadCompaniesPage();
+      showToast(isEdit ? 'Company updated' : 'Company created');
+      await loadCompaniesPage();
     } catch (err) {
-      alert(err.message);
+      showFormErrors(err, {
+        errorId: 'co-form-error',
+        fieldMap: {
+          'body.name': 'co-name',
+          'body.website': 'co-website',
+          'body.location': 'co-location',
+        },
+      });
     } finally {
-      el('co-save').disabled = false;
+      if (companySaveButton.isConnected) {
+        companySaveButton.disabled = false;
+      }
     }
   };
 }
 
-async function deleteCompany(id) {
-  if (!confirm('Delete this company? All its applications will also be deleted.')) return;
+async function deleteCompany(company) {
+  if (!company) return;
+  const accepted = await confirmAction({
+    title: 'Delete company?',
+    message: `${company.name} has no applications and will be permanently deleted.`,
+    confirmLabel: 'Delete company',
+    danger: true,
+  });
+  if (!accepted) return;
+
   try {
-    await companiesApi.delete(id);
-    loadCompaniesPage();
+    await companiesApi.delete(company.id);
+    showToast('Company deleted');
+    await loadCompaniesPage();
   } catch (err) {
-    alert(err.message);
+    showToast(getErrorMessage(err, 'Company could not be deleted'), 'error');
   }
 }
 
@@ -294,10 +512,24 @@ async function loadApplicationsPage() {
     populateCompanyFilter([]);
   }
 
+  hydrateApplicationFilters();
   el('new-application-btn').onclick = () => openApplicationForm(null);
-  el('apply-filters-btn').onclick = applyFilters;
+  el('apply-filters-btn').onclick = () => applyFilters();
+  el('filter-search').oninput = () => {
+    clearTimeout(searchTimer);
+    searchTimer = setTimeout(() => applyFilters(), 250);
+  };
+  el('filter-search').onkeydown = event => {
+    if (event.key === 'Enter') {
+      clearTimeout(searchTimer);
+      applyFilters();
+    }
+  };
+  ['filter-status', 'filter-company', 'filter-archived', 'filter-sort'].forEach(id => {
+    el(id).onchange = () => applyFilters();
+  });
 
-  await fetchAndRenderApplications({});
+  await applyFilters({ updateUrl: false });
 }
 
 function populateCompanyFilter(list) {
@@ -312,22 +544,56 @@ function populateCompanyFilter(list) {
   });
 }
 
-function applyFilters() {
+function hydrateApplicationFilters() {
+  const query = new URLSearchParams(window.location.search);
+  el('filter-search').value = query.get('search') || '';
+  el('filter-status').value = query.get('status') || '';
+  el('filter-company').value = query.get('companyId') || '';
+  el('filter-archived').value = query.get('archived') || 'active';
+  el('filter-sort').value = query.get('sort') || 'updated_desc';
+}
+
+function applicationFilters() {
+  const search = el('filter-search').value.trim();
   const status = el('filter-status').value;
   const companyId = el('filter-company').value;
-  const params = {};
+  const archived = el('filter-archived').value;
+  const sort = el('filter-sort').value;
+  const params = { archived, sort };
+  if (search) params.search = search;
   if (status) params.status = status;
   if (companyId) params.companyId = companyId;
-  fetchAndRenderApplications(params);
+  return params;
+}
+
+function syncApplicationFilterUrl(params) {
+  if (window.location.pathname !== PAGE_ROUTES.applications) return;
+  const query = new URLSearchParams();
+  if (params.search) query.set('search', params.search);
+  if (params.status) query.set('status', params.status);
+  if (params.companyId) query.set('companyId', params.companyId);
+  if (params.archived !== 'active') query.set('archived', params.archived);
+  if (params.sort !== 'updated_desc') query.set('sort', params.sort);
+  const suffix = query.toString() ? `?${query}` : '';
+  writeHistory(`${PAGE_ROUTES.applications}${suffix}`, 'replace');
+}
+
+function applyFilters({ updateUrl = true } = {}) {
+  const params = applicationFilters();
+  if (updateUrl) syncApplicationFilterUrl(params);
+  return fetchAndRenderApplications(params);
 }
 
 async function fetchAndRenderApplications(params) {
   showLoading('applications-list');
+  el('applications-list').setAttribute('aria-busy', 'true');
   try {
     const list = await appsApi.list(params);
     renderApplicationsList(list);
   } catch (err) {
     setHtml('applications-list', alertError(getErrorMessage(err, 'Failed to load applications')));
+  } finally {
+    el('applications-list').removeAttribute('aria-busy');
   }
 }
 
@@ -341,30 +607,67 @@ function renderApplicationsList(list) {
     return;
   }
 
-  const companiesMap = Object.fromEntries(state.companies.map(c => [c.id, c.name]));
+  setHtml('applications-list', warningHtml + list.map(a => {
+    const quickStatusOptions = ALL_STATUSES.map(status =>
+      `<option value="${escapeAttr(status)}" ${a.status === status ? 'selected' : ''}>${escapeHtml(statusLabel(status))}</option>`
+    ).join('');
 
-  setHtml('applications-list', warningHtml + list.map(a => `
+    return `
     <div class="app-card" data-id="${escapeAttr(a.id)}">
-      <div class="app-card-left">
-        <div class="app-card-title">${escapeHtml(a.title)}</div>
+      <a class="app-card-left app-card-open" data-id="${escapeAttr(a.id)}" href="/app/applications/${escapeAttr(a.id)}" aria-label="Open ${escapeAttr(a.title)}">
+        <div class="app-card-title-row">
+          <div class="app-card-title">${escapeHtml(a.title)}</div>
+          ${a.archivedAt ? '<span class="badge badge-archived">Archived</span>' : ''}
+        </div>
         <div class="app-card-meta">
-          <span>${escapeHtml(companiesMap[a.companyId] || 'Unknown company')}</span>
+          <span>${escapeHtml(a.company?.name || 'Unknown company')}</span>
           ${statusBadge(a.status || 'wishlist')}
           ${a.salary ? `<span>Salary ${escapeHtml(a.salary)}</span>` : ''}
           ${a.appliedAt ? `<span>Applied ${formatDate(a.appliedAt)}</span>` : ''}
+          ${a.source ? `<span>Source ${escapeHtml(a.source)}</span>` : ''}
         </div>
-      </div>
+        ${a.nextAction ? (() => {
+          const timing = actionTiming(a.nextActionAt);
+          return `<div class="app-next-action">
+            <span>${escapeHtml(a.nextAction)}</span>
+            <span class="action-deadline action-deadline-${escapeAttr(timing.tone)}">${escapeHtml(timing.label)}</span>
+          </div>`;
+        })() : ''}
+      </a>
       <div class="app-card-actions">
+        ${a.archivedAt ? '' : `
+          <label class="sr-only" for="quick-status-${escapeAttr(a.id)}">Change status for ${escapeHtml(a.title)}</label>
+          <select class="quick-status" id="quick-status-${escapeAttr(a.id)}" data-id="${escapeAttr(a.id)}" aria-label="Change status for ${escapeAttr(a.title)}">
+            ${quickStatusOptions}
+          </select>
+        `}
         <button class="btn btn-ghost btn-edit-app" data-id="${escapeAttr(a.id)}">Edit</button>
-        <button class="btn btn-danger btn-delete-app" data-id="${escapeAttr(a.id)}">Delete</button>
+        ${a.archivedAt
+          ? `<button class="btn btn-secondary btn-restore-app" data-id="${escapeAttr(a.id)}">Restore</button>`
+          : `<button class="btn btn-secondary btn-archive-app" data-id="${escapeAttr(a.id)}">Archive</button>`}
       </div>
-    </div>`).join(''));
+    </div>`;
+  }).join(''));
 
-  // Click card (not buttons) opens detail
-  document.querySelectorAll('.app-card').forEach(card => {
-    card.addEventListener('click', e => {
-      if (e.target.closest('button')) return;
-      openApplicationDetail(Number(card.dataset.id));
+  document.querySelectorAll('.app-card-open').forEach(link => {
+    link.addEventListener('click', event => {
+      if (
+        event.button !== 0 ||
+        event.metaKey ||
+        event.ctrlKey ||
+        event.shiftKey ||
+        event.altKey
+      ) {
+        return;
+      }
+      event.preventDefault();
+      openApplicationDetail(Number(link.dataset.id));
+    });
+    link.addEventListener('keydown', event => {
+      if (event.key === 'Enter' || event.key === ' ') {
+        event.preventDefault();
+        openApplicationDetail(Number(link.dataset.id));
+      }
     });
   });
 
@@ -375,51 +678,100 @@ function renderApplicationsList(list) {
     });
   });
 
-  document.querySelectorAll('.btn-delete-app').forEach(btn => {
-    btn.addEventListener('click', () => deleteApplication(Number(btn.dataset.id)));
+  document.querySelectorAll('.btn-archive-app').forEach(btn => {
+    btn.addEventListener('click', () => archiveApplication(Number(btn.dataset.id)));
   });
+
+  document.querySelectorAll('.btn-restore-app').forEach(btn => {
+    btn.addEventListener('click', () => archiveApplication(Number(btn.dataset.id), true));
+  });
+
+  document.querySelectorAll('.quick-status').forEach(select => {
+    select.addEventListener('change', () => {
+      updateApplicationStatus(Number(select.dataset.id), select.value, select);
+    });
+  });
+}
+
+async function updateApplicationStatus(id, status, select) {
+  select.disabled = true;
+  try {
+    await appsApi.update(id, { status });
+    showToast(`Status changed to ${statusLabel(status)}`);
+    await applyFilters({ updateUrl: false });
+  } catch (err) {
+    showToast(getErrorMessage(err, 'Status could not be changed'), 'error');
+    await applyFilters({ updateUrl: false });
+  } finally {
+    if (select.isConnected) select.disabled = false;
+  }
 }
 
 function openApplicationForm(app) {
   const isEdit = !!app;
-  if (!isEdit && state.companies.length === 0) {
-    openModal('New Application', `
-      ${alertError(applicationsCompanyLoadError || 'Add a company before creating an application.')}
-      <div class="form-actions">
-        <button class="btn btn-secondary" id="ap-cancel">Close</button>
-      </div>
-    `);
-    el('ap-cancel').onclick = closeModal;
-    return;
-  }
-
   const companiesOptions = state.companies.map(c =>
     `<option value="${escapeAttr(c.id)}" ${isEdit && app.companyId === c.id ? 'selected' : ''}>${escapeHtml(c.name)}</option>`
   ).join('');
 
   const statusOptions = ALL_STATUSES.map(s =>
-    `<option value="${escapeAttr(s)}" ${isEdit && app.status === s ? 'selected' : ''}>${escapeHtml(statusLabel(s))}</option>`
+    `<option value="${escapeAttr(s)}" ${(isEdit && app.status === s) || (!isEdit && s === 'wishlist') ? 'selected' : ''}>${escapeHtml(statusLabel(s))}</option>`
   ).join('');
 
   openModal(isEdit ? 'Edit Application' : 'New Application', `
-    <div class="field"><label>Job Title *</label><input id="ap-title" type="text" value="${isEdit ? escapeAttr(app.title) : ''}" /></div>
-    <div class="field"><label>Company *</label>
+    <div id="ap-form-error" class="alert alert-error hidden" role="alert"></div>
+    ${applicationsCompanyLoadError && !isEdit ? alertError(`Existing companies could not be loaded: ${applicationsCompanyLoadError}. You can still create a new one.`) : ''}
+    <div class="field"><label for="ap-title">Job Title *</label><input id="ap-title" type="text" value="${isEdit ? escapeAttr(app.title) : ''}" /></div>
+    <div class="field" id="ap-company-select-field"><label for="ap-company">Company *</label>
       <select id="ap-company" ${isEdit ? 'disabled' : ''}><option value="">Select company...</option>${companiesOptions}</select>
       ${isEdit ? '<div class="field-hint">Company is locked after creation.</div>' : ''}
     </div>
-    <div class="form-row">
-      <div class="field"><label>Status</label>
-        <select id="ap-status"><option value="">Select status</option>${statusOptions}</select>
+    ${!isEdit ? `
+      <button type="button" class="inline-company-toggle" id="ap-new-company-toggle">+ Create a company here</button>
+      <div id="ap-new-company-fields" class="inline-company-fields hidden">
+        <div class="field"><label for="ap-company-name">Company name *</label><input id="ap-company-name" type="text" /></div>
+        <div class="form-row">
+          <div class="field"><label for="ap-company-website">Website</label><input id="ap-company-website" type="url" placeholder="https://" /></div>
+          <div class="field"><label for="ap-company-location">Location</label><input id="ap-company-location" type="text" /></div>
+        </div>
       </div>
-      <div class="field"><label>Salary</label>
+    ` : ''}
+    <div class="form-row">
+      <div class="field"><label for="ap-status">Status</label>
+        <select id="ap-status">${statusOptions}</select>
+      </div>
+      <div class="field"><label for="ap-salary">Salary</label>
         <input id="ap-salary" type="text" value="${isEdit && app.salary ? escapeAttr(app.salary) : ''}" placeholder="e.g. 70k" />
       </div>
     </div>
-    <div class="field"><label>Job URL</label>
+    <div class="field"><label for="ap-joburl">Job URL</label>
       <input id="ap-joburl" type="url" value="${isEdit && app.jobUrl ? escapeAttr(app.jobUrl) : ''}" placeholder="https://" />
     </div>
-    <div class="field"><label>Applied At</label>
+    <div class="field"><label for="ap-applied">Applied At</label>
       <input id="ap-applied" type="date" value="${isEdit && app.appliedAt ? escapeAttr(String(app.appliedAt).substring(0,10)) : ''}" />
+    </div>
+    <div class="form-section-title">Next action</div>
+    <div class="field"><label for="ap-next-action">What needs to happen next?</label>
+      <input id="ap-next-action" type="text" value="${isEdit && app.nextAction ? escapeAttr(app.nextAction) : ''}" placeholder="Follow up with recruiter" />
+    </div>
+    <div class="field"><label for="ap-next-action-at">Deadline</label>
+      <input id="ap-next-action-at" type="datetime-local" value="${isEdit ? escapeAttr(toDateTimeLocalValue(app.nextActionAt)) : ''}" />
+    </div>
+    <div class="form-section-title">Contact &amp; source</div>
+    <div class="form-row">
+      <div class="field"><label for="ap-contact-name">Contact name</label>
+        <input id="ap-contact-name" type="text" value="${isEdit && app.contactName ? escapeAttr(app.contactName) : ''}" />
+      </div>
+      <div class="field"><label for="ap-contact-email">Contact email</label>
+        <input id="ap-contact-email" type="email" value="${isEdit && app.contactEmail ? escapeAttr(app.contactEmail) : ''}" />
+      </div>
+    </div>
+    <div class="form-row">
+      <div class="field"><label for="ap-contact-phone">Contact phone</label>
+        <input id="ap-contact-phone" type="tel" value="${isEdit && app.contactPhone ? escapeAttr(app.contactPhone) : ''}" />
+      </div>
+      <div class="field"><label for="ap-source">Source</label>
+        <input id="ap-source" type="text" value="${isEdit && app.source ? escapeAttr(app.source) : ''}" placeholder="LinkedIn, referral…" />
+      </div>
     </div>
     <div class="form-actions">
       <button class="btn btn-secondary" id="ap-cancel">Cancel</button>
@@ -427,61 +779,200 @@ function openApplicationForm(app) {
     </div>
   `);
 
+  let useNewCompany = !isEdit && state.companies.length === 0;
+  const setCompanyMode = enabled => {
+    useNewCompany = enabled;
+    el('ap-new-company-fields').classList.toggle('hidden', !enabled);
+    el('ap-company-select-field').classList.toggle('hidden', enabled);
+    el('ap-company').disabled = enabled;
+    el('ap-new-company-toggle').textContent = enabled
+      ? '← Choose an existing company'
+      : '+ Create a company here';
+  };
+
+  if (!isEdit) {
+    el('ap-new-company-toggle').onclick = () => setCompanyMode(!useNewCompany);
+    setCompanyMode(useNewCompany);
+    if (state.companies.length === 0) {
+      el('ap-new-company-toggle').classList.add('hidden');
+    }
+  }
+
+  const applicationFieldMap = {
+    'body.title': 'ap-title',
+    'body.companyId': 'ap-company',
+    'body.company.name': 'ap-company-name',
+    'body.company.website': 'ap-company-website',
+    'body.company.location': 'ap-company-location',
+    'body.status': 'ap-status',
+    'body.salary': 'ap-salary',
+    'body.jobUrl': 'ap-joburl',
+    'body.appliedAt': 'ap-applied',
+    'body.nextAction': 'ap-next-action',
+    'body.nextActionAt': 'ap-next-action-at',
+    'body.contactName': 'ap-contact-name',
+    'body.contactEmail': 'ap-contact-email',
+    'body.contactPhone': 'ap-contact-phone',
+    'body.source': 'ap-source',
+  };
+  const displayApplicationError = error => showFormErrors(error, {
+    errorId: 'ap-form-error',
+    fieldMap: applicationFieldMap,
+  });
+  const localApplicationError = (field, message) => ({
+    message,
+    details: [{ field, message }],
+  });
+
   el('ap-cancel').onclick = closeModal;
-  el('ap-save').onclick = async () => {
+  const applicationSaveButton = el('ap-save');
+  applicationSaveButton.onclick = async () => {
     const title = el('ap-title').value.trim();
     const companyId = Number(el('ap-company').value);
     const status = el('ap-status').value;
     const salary = el('ap-salary').value.trim();
     const jobUrl = el('ap-joburl').value.trim();
     const appliedAt = el('ap-applied').value;
+    const nextAction = el('ap-next-action').value.trim();
+    const nextActionAt = el('ap-next-action-at').value;
+    const contactName = el('ap-contact-name').value.trim();
+    const contactEmail = el('ap-contact-email').value.trim();
+    const contactPhone = el('ap-contact-phone').value.trim();
+    const source = el('ap-source').value.trim();
 
-    if (!title) { alert('Title is required'); return; }
-    if (!isEdit && !companyId) { alert('Company is required'); return; }
+    clearFormErrors();
+    el('ap-form-error').classList.add('hidden');
+    if (!title) {
+      displayApplicationError(localApplicationError('body.title', 'Title is required'));
+      return;
+    }
+    if (!isEdit && !useNewCompany && !companyId) {
+      displayApplicationError(localApplicationError('body.companyId', 'Choose a company or create a new one'));
+      return;
+    }
     if (jobUrl && !safeExternalUrl(jobUrl)) {
-      alert('Job URL must start with http:// or https://');
+      displayApplicationError(localApplicationError('body.jobUrl', 'Job URL must start with http:// or https://'));
       return;
     }
 
-    const payload = { title };
-    if (!isEdit) payload.companyId = companyId;
-    if (status) payload.status = status;
-    if (salary) payload.salary = salary;
-    if (jobUrl) payload.jobUrl = jobUrl;
-    if (appliedAt) payload.appliedAt = new Date(appliedAt).toISOString();
+    const payload = {
+      title,
+      status,
+      salary: salary || null,
+      jobUrl: jobUrl || null,
+      appliedAt: appliedAt ? new Date(appliedAt).toISOString() : null,
+      nextAction: nextAction || null,
+      nextActionAt: nextActionAt ? new Date(nextActionAt).toISOString() : null,
+      contactName: contactName || null,
+      contactEmail: contactEmail || null,
+      contactPhone: contactPhone || null,
+      source: source || null,
+    };
 
-    el('ap-save').disabled = true;
+    if (!isEdit && useNewCompany) {
+      const name = el('ap-company-name').value.trim();
+      const website = el('ap-company-website').value.trim();
+      const location = el('ap-company-location').value.trim();
+
+      if (!name) {
+        displayApplicationError(localApplicationError('body.company.name', 'Company name is required'));
+        return;
+      }
+      if (website && !safeExternalUrl(website)) {
+        displayApplicationError(localApplicationError('body.company.website', 'Company website must start with http:// or https://'));
+        return;
+      }
+
+      payload.company = { name };
+      if (website) payload.company.website = website;
+      if (location) payload.company.location = location;
+    } else if (!isEdit) {
+      payload.companyId = companyId;
+    }
+
+    applicationSaveButton.disabled = true;
+    const wasDetailOpen = state.detailApplicationId === app?.id;
     try {
       if (isEdit) {
         await appsApi.update(app.id, payload);
       } else {
         await appsApi.create(payload);
+        if (useNewCompany) {
+          const companiesList = await companiesApi.list();
+          setCompanies(companiesList);
+          populateCompanyFilter(companiesList);
+        }
       }
       closeModal();
-      if (isEdit && !el('detail-panel').classList.contains('hidden')) {
-        await openApplicationDetail(app.id);
+      showToast(isEdit ? 'Application updated' : 'Application created');
+      if (wasDetailOpen) {
+        await openApplicationDetail(app.id, { historyMode: 'none' });
+      } else {
+        await refreshCurrentPage();
       }
-      applyFilters();
     } catch (err) {
-      alert(err.message);
+      displayApplicationError(err);
     } finally {
-      el('ap-save').disabled = false;
+      if (applicationSaveButton.isConnected) {
+        applicationSaveButton.disabled = false;
+      }
     }
   };
 }
 
+async function archiveApplication(id, restore = false) {
+  const wasDetailOpen = state.detailApplicationId === id;
+  try {
+    if (restore) {
+      await appsApi.restore(id);
+    } else {
+      await appsApi.archive(id);
+    }
+    showToast(restore ? 'Application restored' : 'Application archived');
+    if (wasDetailOpen) {
+      closeDetailRoute();
+    } else {
+      await refreshCurrentPage();
+    }
+  } catch (err) {
+    showToast(getErrorMessage(err, 'Application could not be updated'), 'error');
+  }
+}
+
 async function deleteApplication(id) {
-  if (!confirm('Delete this application?')) return;
+  const accepted = await confirmAction({
+    title: 'Delete application permanently?',
+    message: 'The application, its status history, and all notes will be deleted. This cannot be undone.',
+    confirmLabel: 'Delete permanently',
+    danger: true,
+  });
+  if (!accepted) return;
+
+  const wasDetailOpen = state.detailApplicationId === id;
   try {
     await appsApi.delete(id);
-    applyFilters();
+    showToast('Application permanently deleted');
+    if (wasDetailOpen) {
+      closeDetailRoute();
+    } else {
+      await refreshCurrentPage();
+    }
   } catch (err) {
-    alert(err.message);
+    showToast(getErrorMessage(err, 'Application could not be deleted'), 'error');
   }
 }
 
 // ===== APPLICATION DETAIL =====
-async function openApplicationDetail(id) {
+async function openApplicationDetail(id, { historyMode = 'push' } = {}) {
+  if (historyMode !== 'none') {
+    const returnUrl = `${window.location.pathname}${window.location.search}`;
+    writeHistory(
+      `/app/applications/${id}`,
+      historyMode,
+      { returnUrl },
+    );
+  }
+  setDetailApplication(id);
   showDetailPanel('Loading...', '<div class="loading">Loading...</div>');
 
   try {
@@ -492,13 +983,16 @@ async function openApplicationDetail(id) {
     ]);
 
     if (state.companies.length === 0) setCompanies(companiesList);
-    const companyName = state.companies.find(c => c.id === app.companyId)?.name || '-';
+    const companyName = app.company?.name
+      || state.companies.find(c => c.id === app.companyId)?.name
+      || '-';
 
     el('detail-title').textContent = app.title;
     el('detail-body').innerHTML = buildDetailBody(app, companyName, notesList);
 
     bindDetailEvents(app, notesList);
   } catch (err) {
+    el('detail-title').textContent = 'Application unavailable';
     el('detail-body').innerHTML = alertError(getErrorMessage(err, 'Failed to load application'));
   }
 }
@@ -507,31 +1001,80 @@ function buildDetailBody(app, companyName, notesList) {
   const jobLink = app.jobUrl
     ? renderExternalLink(app.jobUrl, 'Open link') || `<span>${escapeHtml(app.jobUrl)}</span>`
     : '';
+  const contactEmail = app.contactEmail
+    ? `<a href="mailto:${escapeAttr(app.contactEmail)}">${escapeHtml(app.contactEmail)}</a>`
+    : '-';
+  const contactPhone = app.contactPhone
+    ? `<a href="tel:${escapeAttr(app.contactPhone)}">${escapeHtml(app.contactPhone)}</a>`
+    : '-';
+  const timing = actionTiming(app.nextActionAt);
+  const history = Array.isArray(app.statusHistory) ? app.statusHistory : [];
 
   return `
+    ${app.archivedAt ? '<div class="archive-banner">This application is archived.</div>' : ''}
+    <div class="next-action-card ${app.nextAction ? '' : 'is-empty'}">
+      <div>
+        <div class="detail-field-label">Next action</div>
+        <div class="next-action-title">${app.nextAction ? escapeHtml(app.nextAction) : 'No next action planned'}</div>
+      </div>
+      ${app.nextAction
+        ? `<span class="action-deadline action-deadline-${escapeAttr(timing.tone)}">${escapeHtml(timing.label)}</span>`
+        : ''}
+    </div>
+
     <div class="detail-meta">
       <div><div class="detail-field-label">Company</div><div class="detail-field-value">${escapeHtml(companyName)}</div></div>
       <div><div class="detail-field-label">Status</div><div class="detail-field-value">${statusBadge(app.status || 'wishlist')}</div></div>
       <div><div class="detail-field-label">Salary</div><div class="detail-field-value">${app.salary ? escapeHtml(app.salary) : '-'}</div></div>
       <div><div class="detail-field-label">Applied At</div><div class="detail-field-value">${formatDate(app.appliedAt)}</div></div>
+      <div><div class="detail-field-label">Source</div><div class="detail-field-value">${app.source ? escapeHtml(app.source) : '-'}</div></div>
+      <div><div class="detail-field-label">Contact</div><div class="detail-field-value">${app.contactName ? escapeHtml(app.contactName) : '-'}</div></div>
+      <div><div class="detail-field-label">Contact email</div><div class="detail-field-value">${contactEmail}</div></div>
+      <div><div class="detail-field-label">Contact phone</div><div class="detail-field-value">${contactPhone}</div></div>
       ${jobLink ? `<div><div class="detail-field-label">Job URL</div><div class="detail-field-value">${jobLink}</div></div>` : ''}
       <div><div class="detail-field-label">Created</div><div class="detail-field-value">${formatDate(app.createdAt)}</div></div>
     </div>
 
-    <div style="display:flex;gap:10px;margin-bottom:28px">
+    <div class="detail-actions">
       <button class="btn btn-secondary" id="detail-edit-app">Edit Application</button>
-      <button class="btn btn-danger" id="detail-delete-app">Delete</button>
+      <button class="btn btn-secondary" id="detail-archive-app">${app.archivedAt ? 'Restore' : 'Archive'}</button>
+      <button class="btn btn-danger detail-delete" id="detail-delete-app">Delete permanently</button>
+    </div>
+
+    <div class="history-section">
+      <h4>Status history</h4>
+      <div class="status-timeline">${renderStatusHistory(history)}</div>
     </div>
 
     <div class="notes-section">
       <h4>Notes (${Number(notesList.length || 0)})</h4>
       <div id="notes-list">${renderNotes(notesList)}</div>
       <div class="note-add-form">
+        <div id="note-error" class="alert alert-error hidden" role="alert"></div>
+        <label class="sr-only" for="note-new-content">Add a note</label>
         <textarea id="note-new-content" placeholder="Add a note..."></textarea>
         <button class="btn btn-primary" id="note-add-btn">Add Note</button>
       </div>
     </div>
   `;
+}
+
+function renderStatusHistory(history) {
+  if (history.length === 0) {
+    return '<div class="empty-inline">No status changes recorded yet.</div>';
+  }
+
+  return history.map(item => `
+    <div class="status-history-item">
+      <span class="timeline-dot" style="background:${STATUS_COLORS[item.toStatus] || STATUS_COLORS.wishlist}"></span>
+      <div>
+        <strong>${item.fromStatus
+          ? `${escapeHtml(statusLabel(item.fromStatus))} → ${escapeHtml(statusLabel(item.toStatus))}`
+          : `Started as ${escapeHtml(statusLabel(item.toStatus))}`}</strong>
+        <span>${formatDateTime(item.changedAt)}</span>
+      </div>
+    </div>
+  `).join('');
 }
 
 function renderNotes(notesList) {
@@ -550,27 +1093,22 @@ function renderNotes(notesList) {
 }
 
 function bindDetailEvents(app, notesList) {
-  // Edit app
   el('detail-edit-app').onclick = () => {
     openApplicationForm(app);
   };
 
-  // Delete app
-  el('detail-delete-app').onclick = async () => {
-    if (!confirm('Delete this application?')) return;
-    try {
-      await appsApi.delete(app.id);
-      hideDetailPanel();
-      applyFilters();
-    } catch (err) {
-      alert(err.message);
-    }
-  };
+  el('detail-archive-app').onclick = () => archiveApplication(app.id, Boolean(app.archivedAt));
+  el('detail-delete-app').onclick = () => deleteApplication(app.id);
 
-  // Add note
   el('note-add-btn').onclick = async () => {
     const content = el('note-new-content').value.trim();
-    if (!content) return;
+    el('note-error').classList.add('hidden');
+    if (!content) {
+      el('note-error').textContent = 'Note cannot be empty';
+      el('note-error').classList.remove('hidden');
+      el('note-new-content').focus();
+      return;
+    }
     el('note-add-btn').disabled = true;
     try {
       await notesApi.create({ content, applicationId: app.id });
@@ -578,8 +1116,10 @@ function bindDetailEvents(app, notesList) {
       const updated = await notesApi.list(app.id);
       setHtml('notes-list', renderNotes(updated));
       bindNoteEvents(app, updated);
+      showToast('Note added');
     } catch (err) {
-      alert(err.message);
+      el('note-error').textContent = getErrorMessage(err, 'Note could not be added');
+      el('note-error').classList.remove('hidden');
     } finally {
       el('note-add-btn').disabled = false;
     }
@@ -591,14 +1131,22 @@ function bindDetailEvents(app, notesList) {
 function bindNoteEvents(app, notesList) {
   document.querySelectorAll('.btn-delete-note').forEach(btn => {
     btn.addEventListener('click', async () => {
-      if (!confirm('Delete this note?')) return;
+      const accepted = await confirmAction({
+        title: 'Delete note?',
+        message: 'This note will be permanently deleted.',
+        confirmLabel: 'Delete note',
+        danger: true,
+      });
+      if (!accepted) return;
+
       try {
         await notesApi.delete(Number(btn.dataset.id));
         const updated = await notesApi.list(app.id);
         setHtml('notes-list', renderNotes(updated));
         bindNoteEvents(app, updated);
+        showToast('Note deleted');
       } catch (err) {
-        alert(err.message);
+        showToast(getErrorMessage(err, 'Note could not be deleted'), 'error');
       }
     });
   });
@@ -613,6 +1161,8 @@ function bindNoteEvents(app, notesList) {
       const original = note.content;
 
       contentEl.innerHTML = `
+        <div id="note-edit-error-${noteId}" class="alert alert-error hidden" role="alert"></div>
+        <label class="sr-only" for="note-edit-${noteId}">Edit note</label>
         <textarea id="note-edit-${noteId}" style="width:100%;margin-bottom:8px">${escapeHtml(original)}</textarea>
         <div style="display:flex;gap:8px">
           <button class="btn btn-primary btn-note-save" data-id="${noteId}" style="padding:5px 12px;font-size:12px">Save</button>
@@ -626,14 +1176,20 @@ function bindNoteEvents(app, notesList) {
 
       document.querySelector(`.btn-note-save[data-id="${noteId}"]`).onclick = async () => {
         const newContent = el(`note-edit-${noteId}`).value.trim();
-        if (!newContent) return;
+        if (!newContent) {
+          el(`note-edit-error-${noteId}`).textContent = 'Note cannot be empty';
+          el(`note-edit-error-${noteId}`).classList.remove('hidden');
+          return;
+        }
         try {
           await notesApi.update(noteId, { content: newContent });
           const updated = await notesApi.list(app.id);
           setHtml('notes-list', renderNotes(updated));
           bindNoteEvents(app, updated);
+          showToast('Note updated');
         } catch (err) {
-          alert(err.message);
+          el(`note-edit-error-${noteId}`).textContent = getErrorMessage(err, 'Note could not be updated');
+          el(`note-edit-error-${noteId}`).classList.remove('hidden');
         }
       };
     });

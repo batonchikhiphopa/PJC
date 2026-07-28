@@ -1,121 +1,129 @@
-# PJC Job Tracker API
+# PJC Job Tracker
 
-PJC is a small Express API for tracking job applications, companies, and notes. It is built as a clean MVP backend for a portfolio-ready job search tracker.
+PJC is a job-search workflow tracker with an Express API, a static browser
+frontend, PostgreSQL, Prisma, and cookie-based JWT sessions. Applications keep
+the next action, deadline, contact, source, status history, notes, and archive
+state in one place.
 
-## Stack
+## Requirements
 
-- Node.js with ESM
-- Express
-- PostgreSQL
-- Prisma 7.7 with `@prisma/adapter-pg`
-- Docker Compose
-- JWT authentication
-- `tsx` runtime
+- Node.js `^20.19.0`, `^22.13.0`, or `>=24`
+- Docker Desktop, or another PostgreSQL server
 
-## MVP Features
+## Local setup
 
-- User registration and login
-- JWT-protected routes
-- Owner-based access checks
-- Companies CRUD
-- Applications CRUD with status and company filters
-- Applications dashboard with status, company, and recent activity summaries
-- Notes CRUD
-- Basic request validation
-- Health checks
-- JSON 404 responses
+### One-click Windows launch
 
-## Setup
+Double-click `start-pjc.bat` in the project folder. It checks Node.js and
+Docker, creates a local `.env` when needed, starts PostgreSQL, installs missing
+packages, applies migrations, starts the application server in the launcher
+window, and opens the application in the default browser.
 
-Install dependencies:
+Close the `PJC Server` window to stop the application server. The
+PostgreSQL Docker container remains available for the next launch.
 
-```bash
+For diagnostics without starting the application:
+
+```powershell
+.\start-pjc.bat --check
+```
+
+### Manual launch
+
+Create the local environment file:
+
+```powershell
+Copy-Item .env.example .env
+```
+
+Replace `JWT_SECRET` with a random value containing at least 32 characters.
+
+Install dependencies. Prisma Client is generated automatically:
+
+```powershell
 npm install
 ```
 
-Create a local environment file:
+Start PostgreSQL and apply development migrations:
 
-```bash
-cp .env.example .env
-```
-
-Update `.env` if needed:
-
-```env
-PORT=5000
-DATABASE_URL="postgresql://postgres:postgres@localhost:5432/pjc_db?schema=public"
-JWT_SECRET="change-this-secret"
-```
-
-## Database
-
-Start PostgreSQL with Docker Compose:
-
-```bash
+```powershell
 npm run db:up
+npm run prisma:migrate:dev
 ```
-
-Apply Prisma migrations:
-
-```bash
-npm run prisma:migrate
-```
-
-Generate the Prisma client:
-
-```bash
-npm run prisma:generate
-```
-
-## Run
 
 Start the development server:
 
-```bash
+```powershell
 npm run dev
 ```
 
-Start the server without watch mode:
+Open `http://localhost:5000/`. The root URL redirects to the frontend at
+`/app/dashboard`.
 
-```bash
-npm start
+## Environment
+
+```env
+NODE_ENV=development
+PORT=5000
+DATABASE_URL="postgresql://postgres:postgres@localhost:5432/pjc_db?schema=public"
+JWT_SECRET="replace-with-at-least-32-random-characters"
+SESSION_COOKIE_NAME="pjc_session"
+TRUST_PROXY=false
 ```
 
-By default, the API runs on `http://localhost:5000`.
+The server validates its environment before listening. In production, set
+`NODE_ENV=production`, provide a production database URL and secret, and enable
+`TRUST_PROXY` only when the application is behind a trusted reverse proxy.
 
-## Frontend
+## Quality checks
 
-The Express server also serves the static frontend from:
-
-```text
-http://localhost:5000/client/
+```powershell
+npm run lint
+npm test
+npm run check
+npm run test:integration
 ```
 
-Local startup order:
+The default API tests do not require a running database. They cover routing, security
+headers, authentication boundaries, request validation, malformed JSON, body
+size limits, and the public error contract. `test:integration` requires the
+Docker database and verifies the complete registration, sign-in, application,
+company, dashboard, note, status-history, archive, and restore workflow.
 
-```bash
-npm install
-npm run db:up
-npm run prisma:migrate
+## Database commands
+
+```powershell
 npm run prisma:generate
-npm run dev
+npm run prisma:migrate:dev
+npm run prisma:migrate
+npm run prisma:status
+npm run prisma:studio
 ```
 
-Open `http://localhost:5000/client/` after the server starts. The UI supports sign in and account creation. New accounts are created through the existing `POST /users` API, then the frontend signs in with `POST /auth/login`.
+`prisma:migrate:dev` creates and applies local development migrations.
+`prisma:migrate` uses `prisma migrate deploy` and is intended for deployment.
 
-## Endpoints
+## Authentication
 
-Most endpoints require `Authorization: Bearer <token>` after login.
+Sign-in sets a seven-day JWT session in an HttpOnly, SameSite=Strict cookie.
+The browser frontend does not store the token in `localStorage`. Protected API
+routes also accept `Authorization: Bearer <token>` for compatible API clients.
+
+- `POST /users`
+- `POST /auth/login`
+- `POST /auth/logout`
+- `GET /auth/me`
+
+Repeated registration and sign-in attempts are rate limited.
+
+## API
+
+Most endpoints require authentication.
 
 ### Health
 
 - `GET /health`
 - `GET /health/db`
-
-### Auth
-
-- `POST /auth/login`
-- `GET /auth/me`
 
 ### Users
 
@@ -137,9 +145,41 @@ Most endpoints require `Authorization: Bearer <token>` after login.
 - `GET /applications/dashboard`
 - `GET /applications?status=applied`
 - `GET /applications?companyId=1`
+- `GET /applications?archived=active|archived|all`
+- `GET /applications?search=engineer`
+- `GET /applications?sort=updated_desc|updated_asc|deadline_asc|created_desc|company_asc`
 - `GET /applications/:id`
 - `PATCH /applications/:id`
+- `POST /applications/:id/archive`
+- `POST /applications/:id/restore`
 - `DELETE /applications/:id`
+
+`POST /applications` accepts either an existing `companyId` or a nested
+`company` object. Nested company and application creation run in one database
+transaction. Changing an application's status automatically records an
+immutable status-history entry.
+
+The dashboard returns active status counts, recent applications, and a
+deadline-ordered `nextActions` queue. Archived applications are excluded from
+the dashboard and active list but remain available for restoration.
+
+## Browser routes and interaction
+
+- `/app/dashboard`
+- `/app/applications`
+- `/app/applications/:id`
+- `/app/companies`
+
+These routes can be bookmarked or opened directly. Application filters are
+stored in the query string, so search and sorting views can also be shared or
+restored through browser navigation.
+
+Application cards support keyboard navigation and expose a quick status
+control. Forms use field-level validation, modal dialogs trap focus and close
+with Escape, and completed background actions use non-blocking toast
+notifications. Destructive application deletion uses an explicit confirmation;
+archiving remains the normal reversible action. A company cannot be deleted
+while it still owns applications.
 
 ### Notes
 
@@ -149,3 +189,20 @@ Most endpoints require `Authorization: Bearer <token>` after login.
 - `GET /notes/:id`
 - `PATCH /notes/:id`
 - `DELETE /notes/:id`
+
+Errors use one JSON shape:
+
+```json
+{
+  "error": {
+    "code": "VALIDATION_ERROR",
+    "message": "Request validation failed",
+    "details": [
+      {
+        "field": "body.email",
+        "message": "Email must be valid"
+      }
+    ]
+  }
+}
+```

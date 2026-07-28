@@ -1,73 +1,73 @@
 import { Router } from "express";
-import prisma from "../lib/prisma.js";
 import bcrypt from "bcrypt";
+
+import prisma from "../lib/prisma.js";
 import { authMiddleware } from "../middleware/auth.middleware.js";
+import { authRateLimit } from "../middleware/rate-limit.middleware.js";
+import {
+  validateBody,
+  validateParams,
+} from "../middleware/validate.middleware.js";
+import {
+  conflict,
+  forbidden,
+  notFound,
+} from "../errors/app-error.js";
+import {
+  createUserSchema,
+  idParamsSchema,
+} from "../validation/schemas.js";
 
 const router = Router();
 
-router.post("/", async (req, res) => {
-  try {
-    const { email, password } = req.body;
+router.post(
+  "/",
+  authRateLimit,
+  validateBody(createUserSchema),
+  async (req, res) => {
+    const { email, password } = req.validatedBody;
+    const existingUser = await prisma.user.findFirst({
+      where: {
+        email: {
+          equals: email,
+          mode: "insensitive",
+        },
+      },
+      select: { id: true },
+    });
 
-    if (typeof email !== "string" || typeof password !== "string") {
-      return res.status(400).json({
-        error: "Email and password are required",
-      });
+    if (existingUser) {
+      throw conflict("An account with this email already exists");
     }
 
-    const normalizedEmail = email.trim();
-
-    if (!normalizedEmail || !password) {
-      return res.status(400).json({
-        error: "Email and password are required",
-      });
-    }
-
-    const hashedPassword = await bcrypt.hash(password, 10);
+    const hashedPassword = await bcrypt.hash(password, 12);
 
     const user = await prisma.user.create({
       data: {
-        email: normalizedEmail,
+        email,
         password: hashedPassword,
+      },
+      select: {
+        id: true,
+        email: true,
+        createdAt: true,
+        updatedAt: true,
       },
     });
 
-    res.status(201).json({
-      id: user.id,
-      email: user.email,
-      createdAt: user.createdAt,
-      updatedAt: user.updatedAt,
-    });
-  } catch (error) {
-    console.error("CREATE USER ERROR:", error);
+    return res.status(201).json(user);
+  },
+);
 
-    if (error.code === "P2002") {
-      return res.status(409).json({
-        error: "Email already exists",
-      });
-    }
-
-    res.status(500).json({
-      error: "Failed to create user",
-      message: error.message,
-    });
-  }
-});
-
-router.get("/:id", authMiddleware, async (req, res) => {
-  try {
-    const id = Number(req.params.id);
-
-    if (Number.isNaN(id)) {
-      return res.status(400).json({
-        error: "Invalid user id",
-      });
-    }
+router.get(
+  "/:id",
+  authMiddleware,
+  validateParams(idParamsSchema),
+  async (req, res) => {
+    const { id } = req.validatedParams;
 
     if (req.user.userId !== id) {
-      return res.status(403).json({
-        error: "Forbidden",
-      });
+      throw forbidden();
     }
 
     const user = await prisma.user.findUnique({
@@ -81,20 +81,11 @@ router.get("/:id", authMiddleware, async (req, res) => {
     });
 
     if (!user) {
-      return res.status(404).json({
-        error: "User not found",
-      });
+      throw notFound("User not found");
     }
 
-    res.status(200).json(user);
-  } catch (error) {
-    console.error("GET USER BY ID ERROR:", error);
-
-    res.status(500).json({
-      error: "Failed to fetch user",
-      message: error.message,
-    });
-  }
-});
+    return res.status(200).json(user);
+  },
+);
 
 export default router;

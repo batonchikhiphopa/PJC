@@ -1,31 +1,47 @@
-import jwt from "jsonwebtoken";
+import { env } from "../config/env.js";
+import { unauthorized } from "../errors/app-error.js";
+import { clearSessionCookie } from "../utils/cookies.js";
+import { verifyAuthToken } from "../utils/jwt.js";
 
 export function authMiddleware(req, res, next) {
   const authHeader = req.headers.authorization;
+  let token = req.cookies?.[env.SESSION_COOKIE_NAME];
+  let tokenSource = token ? "cookie" : null;
 
-  if (!authHeader) {
-    return res.status(401).json({
-      error: "Authorization header is required",
-    });
+  if (authHeader) {
+    const [type, bearerToken, ...extraParts] = authHeader.split(" ");
+
+    if (type !== "Bearer" || !bearerToken || extraParts.length > 0) {
+      return next(unauthorized("Invalid authorization format"));
+    }
+
+    token = bearerToken;
+    tokenSource = "header";
   }
 
-  const [type, token] = authHeader.split(" ");
-
-  if (type !== "Bearer" || !token) {
-    return res.status(401).json({
-      error: "Invalid authorization format",
-    });
+  if (!token) {
+    return next(unauthorized());
   }
 
   try {
-    const decoded = jwt.verify(token, process.env.JWT_SECRET);
+    const decoded = verifyAuthToken(token);
 
-    req.user = decoded;
+    if (
+      typeof decoded !== "object" ||
+      !Number.isInteger(decoded.userId) ||
+      decoded.userId <= 0
+    ) {
+      throw new Error("Token payload is invalid");
+    }
 
-    next();
+    req.user = { userId: decoded.userId };
+
+    return next();
   } catch (error) {
-    return res.status(401).json({
-      error: "Invalid or expired token",
-    });
+    if (tokenSource === "cookie") {
+      clearSessionCookie(res);
+    }
+
+    return next(unauthorized("Invalid or expired session"));
   }
 }

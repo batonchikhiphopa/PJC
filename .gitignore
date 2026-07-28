@@ -1,3 +1,7 @@
 node_modules
 .env
+dev-login.bat
+/dev-login-seed.mjs
+/client/dev-login.html
+/client/dev-login.js
 /src/generated/prisma

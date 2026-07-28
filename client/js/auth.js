@@ -7,14 +7,11 @@ import { setUser } from './state.js';
 let authMode = 'login';
 
 export async function checkSession() {
-  const token = localStorage.getItem('pjc_token');
-  if (!token) return false;
   try {
     const user = await authApi.me();
     setUser(user);
     return user;
   } catch {
-    localStorage.removeItem('pjc_token');
     return false;
   }
 }
@@ -56,7 +53,6 @@ export function initLoginScreen(onSuccess) {
       }
 
       const res = await authApi.login(email, password);
-      localStorage.setItem('pjc_token', res.token);
       setUser(res.user);
       hideEl('login-screen');
       onSuccess(res.user);
@@ -93,6 +89,8 @@ function setAuthMode(mode) {
 
   el('auth-login-tab').classList.toggle('active', !isRegister);
   el('auth-register-tab').classList.toggle('active', isRegister);
+  el('auth-login-tab').setAttribute('aria-selected', String(!isRegister));
+  el('auth-register-tab').setAttribute('aria-selected', String(isRegister));
 
   if (isRegister) {
     showEl('confirm-password-field');
@@ -102,7 +100,10 @@ function setAuthMode(mode) {
   }
 }
 
-export function logout() {
-  localStorage.removeItem('pjc_token');
-  window.location.reload();
+export async function logout() {
+  try {
+    await authApi.logout();
+  } finally {
+    window.location.reload();
+  }
 }

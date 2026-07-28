@@ -1,31 +1,31 @@
-import express from "express";
+import { Router } from "express";
 import bcrypt from "bcrypt";
-import jwt from "jsonwebtoken";
+
 import prisma from "../lib/prisma.js";
 import { authMiddleware } from "../middleware/auth.middleware.js";
+import { authRateLimit } from "../middleware/rate-limit.middleware.js";
+import { validateBody } from "../middleware/validate.middleware.js";
+import { notFound, unauthorized } from "../errors/app-error.js";
+import { clearSessionCookie, setSessionCookie } from "../utils/cookies.js";
+import { signAuthToken } from "../utils/jwt.js";
+import { loginSchema } from "../validation/schemas.js";
 
-const router = express.Router();
+const router = Router();
 
-router.post("/login", async (req, res) => {
-  try {
-    const { email, password } = req.body;
+router.post(
+  "/login",
+  authRateLimit,
+  validateBody(loginSchema),
+  async (req, res) => {
+    const { email, password } = req.validatedBody;
 
-    if (typeof email !== "string" || typeof password !== "string") {
-      return res.status(400).json({
-        error: "Email and password are required",
-      });
-    }
-
-    const normalizedEmail = email.trim();
-
-    if (!normalizedEmail || !password) {
-      return res.status(400).json({
-        error: "Email and password are required",
-      });
-    }
-
-    const user = await prisma.user.findUnique({
-      where: { email: normalizedEmail },
+    const user = await prisma.user.findFirst({
+      where: {
+        email: {
+          equals: email,
+          mode: "insensitive",
+        },
+      },
       select: {
         id: true,
         email: true,
@@ -33,25 +33,12 @@ router.post("/login", async (req, res) => {
       },
     });
 
-    if (!user) {
-      return res.status(401).json({
-        error: "Invalid email or password",
-      });
+    if (!user || !(await bcrypt.compare(password, user.password))) {
+      throw unauthorized("Invalid email or password");
     }
 
-    const isPasswordValid = await bcrypt.compare(password, user.password);
-
-    if (!isPasswordValid) {
-      return res.status(401).json({
-        error: "Invalid email or password",
-      });
-    }
-
-    const token = jwt.sign(
-      { userId: user.id },
-      process.env.JWT_SECRET,
-      { expiresIn: "7d" }
-    );
+    const token = signAuthToken(user.id);
+    setSessionCookie(res, token);
 
     return res.status(200).json({
       token,
@@ -60,41 +47,31 @@ router.post("/login", async (req, res) => {
         email: user.email,
       },
     });
-  } catch (error) {
-    console.error("LOGIN ERROR:", error);
+  },
+);
 
-    return res.status(500).json({
-      error: "Failed to login",
-    });
-  }
+router.post("/logout", (req, res) => {
+  clearSessionCookie(res);
+  return res.status(204).end();
 });
 
 router.get("/me", authMiddleware, async (req, res) => {
-  try {
-    const user = await prisma.user.findUnique({
-      where: { id: req.user.userId },
-      select: {
-        id: true,
-        email: true,
-        createdAt: true,
-        updatedAt: true,
-      },
-    });
+  const user = await prisma.user.findUnique({
+    where: { id: req.user.userId },
+    select: {
+      id: true,
+      email: true,
+      createdAt: true,
+      updatedAt: true,
+    },
+  });
 
-    if (!user) {
-      return res.status(404).json({
-        error: "User not found",
-      });
-    }
-
-    return res.status(200).json(user);
-  } catch (error) {
-    console.error("GET ME ERROR:", error);
-
-    return res.status(500).json({
-      error: "Failed to fetch current user",
-    });
+  if (!user) {
+    clearSessionCookie(res);
+    throw notFound("User not found");
   }
+
+  return res.status(200).json(user);
 });
 
 export default router;

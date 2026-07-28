@@ -1,209 +1,213 @@
 import { Router } from "express";
+
 import prisma from "../lib/prisma.js";
 import { authMiddleware } from "../middleware/auth.middleware.js";
+import {
+  validateBody,
+  validateParams,
+  validateQuery,
+} from "../middleware/validate.middleware.js";
+import { notFound } from "../errors/app-error.js";
+import {
+  applicationQuerySchema,
+  applicationStatuses,
+  createApplicationSchema,
+  idParamsSchema,
+  updateApplicationSchema,
+} from "../validation/schemas.js";
 
 const router = Router();
 
-const allowedStatuses = [
-  "wishlist",
-  "applied",
-  "interview",
-  "test_task",
-  "offer",
-  "rejected",
-  "ghosted",
-];
+router.use(authMiddleware);
 
-router.post("/", authMiddleware, async (req, res) => {
-  try {
-    const { title, companyId, status, jobUrl, salary, appliedAt } = req.body;
-
-    if (typeof title !== "string") {
-      return res.status(400).json({
-        error: "Title is required",
-      });
-    }
-
-    const normalizedTitle = title.trim();
-
-    if (!normalizedTitle) {
-      return res.status(400).json({
-        error: "Title is required",
-      });
-    }
-
-    if (typeof companyId !== "number") {
-      return res.status(400).json({
-        error: "Company id is required",
-      });
-    }
-
-    if (status !== undefined && typeof status !== "string") {
-      return res.status(400).json({
-        error: "Status must be a string",
-      });
-    }
-
-    if (status !== undefined && !allowedStatuses.includes(status)) {
-      return res.status(400).json({
-        error: "Invalid application status",
-      });
-    }
-
-    if (jobUrl !== undefined && typeof jobUrl !== "string") {
-      return res.status(400).json({
-        error: "Job URL must be a string",
-      });
-    }
-
-    if (salary !== undefined && typeof salary !== "string") {
-      return res.status(400).json({
-        error: "Salary must be a string",
-      });
-    }
-
-    if (appliedAt !== undefined && typeof appliedAt !== "string") {
-      return res.status(400).json({
-        error: "Applied date must be a string",
-      });
-    }
-
-    let normalizedAppliedAt = null;
-
-    if (appliedAt !== undefined) {
-      const parsedDate = new Date(appliedAt);
-
-      if (Number.isNaN(parsedDate.getTime())) {
-        return res.status(400).json({
-          error: "Invalid appliedAt date",
-        });
-      }
-
-      normalizedAppliedAt = parsedDate;
-    }
-
-    const company = await prisma.company.findFirst({
-      where: {
-        id: companyId,
-        userId: req.user.userId,
-      },
-    });
-
-    if (!company) {
-      return res.status(404).json({
-        error: "Company not found",
-      });
-    }
-
-    const normalizedJobUrl =
-      jobUrl === undefined ? undefined : jobUrl.trim() || null;
-
-    const normalizedSalary =
-      salary === undefined ? undefined : salary.trim() || null;
-
-    const application = await prisma.application.create({
-      data: {
-        title: normalizedTitle,
-        status,
-        jobUrl: normalizedJobUrl,
-        salary: normalizedSalary,
-        appliedAt: normalizedAppliedAt,
-        userId: req.user.userId,
-        companyId,
-      },
-    });
-
-    return res.status(201).json(application);
-  } catch (error) {
-    console.error("CREATE APPLICATION ERROR:", error);
-
-    return res.status(500).json({
-      error: "Failed to create application",
-    });
+function archiveFilter(value) {
+  if (value === "archived") {
+    return { archivedAt: { not: null } };
   }
+
+  if (value === "all") {
+    return {};
+  }
+
+  return { archivedAt: null };
+}
+
+function applicationOrder(sort) {
+  const choices = {
+    updated_desc: [{ updatedAt: "desc" }],
+    updated_asc: [{ updatedAt: "asc" }],
+    deadline_asc: [
+      { nextActionAt: { sort: "asc", nulls: "last" } },
+      { updatedAt: "desc" },
+    ],
+    created_desc: [{ createdAt: "desc" }],
+    company_asc: [
+      { company: { name: "asc" } },
+      { updatedAt: "desc" },
+    ],
+  };
+
+  return choices[sort] ?? choices.updated_desc;
+}
+
+function applicationSearch(search) {
+  if (!search) return {};
+
+  return {
+    OR: [
+      { title: { contains: search, mode: "insensitive" } },
+      { source: { contains: search, mode: "insensitive" } },
+      { contactName: { contains: search, mode: "insensitive" } },
+      { nextAction: { contains: search, mode: "insensitive" } },
+      {
+        company: {
+          name: { contains: search, mode: "insensitive" },
+        },
+      },
+    ],
+  };
+}
+
+async function findOwnedApplication(id, userId, select = { id: true }) {
+  const application = await prisma.application.findFirst({
+    where: { id, userId },
+    select,
+  });
+
+  if (!application) {
+    throw notFound("Application not found");
+  }
+
+  return application;
+}
+
+router.post("/", validateBody(createApplicationSchema), async (req, res) => {
+  const userId = req.user.userId;
+  const {
+    companyId: requestedCompanyId,
+    company: newCompany,
+    ...applicationData
+  } = req.validatedBody;
+
+  const application = await prisma.$transaction(async (transaction) => {
+    let companyId = requestedCompanyId;
+
+    if (newCompany) {
+      const company = await transaction.company.create({
+        data: {
+          ...newCompany,
+          userId,
+        },
+        select: { id: true },
+      });
+      companyId = company.id;
+    } else {
+      const company = await transaction.company.findFirst({
+        where: {
+          id: requestedCompanyId,
+          userId,
+        },
+        select: { id: true },
+      });
+
+      if (!company) {
+        throw notFound("Company not found");
+      }
+    }
+
+    const createdApplication = await transaction.application.create({
+      data: {
+        ...applicationData,
+        companyId,
+        userId,
+      },
+      include: {
+        company: {
+          select: { id: true, name: true },
+        },
+      },
+    });
+
+    await transaction.applicationStatusHistory.create({
+      data: {
+        toStatus: createdApplication.status,
+        userId,
+        applicationId: createdApplication.id,
+      },
+    });
+
+    return createdApplication;
+  });
+
+  return res.status(201).json(application);
 });
 
-router.get("/", authMiddleware, async (req, res) => {
-  try {
-    const { status, companyId } = req.query;
-
-    const where = {
-      userId: req.user.userId,
-    };
-
-    if (status !== undefined) {
-      if (typeof status !== "string" || !allowedStatuses.includes(status)) {
-        return res.status(400).json({
-          error: "Invalid application status",
-        });
-      }
-
-      where.status = status;
-    }
-
-    if (companyId !== undefined) {
-      const parsedCompanyId = Number(companyId);
-
-      if (Number.isNaN(parsedCompanyId)) {
-        return res.status(400).json({
-          error: "Invalid company id",
-        });
-      }
-
-      where.companyId = parsedCompanyId;
-    }
-
+router.get(
+  "/",
+  validateQuery(applicationQuerySchema),
+  async (req, res) => {
+    const { archived, search, sort, ...filters } = req.validatedQuery;
     const applications = await prisma.application.findMany({
-      where,
-      orderBy: {
-        createdAt: "desc",
+      where: {
+        userId: req.user.userId,
+        ...filters,
+        ...archiveFilter(archived),
+        ...applicationSearch(search),
       },
+      include: {
+        company: {
+          select: { id: true, name: true },
+        },
+      },
+      orderBy: applicationOrder(sort),
     });
 
     return res.status(200).json(applications);
-  } catch (error) {
-    console.error("GET APPLICATIONS ERROR:", error);
+  },
+);
 
-    return res.status(500).json({
-      error: "Failed to fetch applications",
-    });
-  }
-});
+router.get("/dashboard", async (req, res) => {
+  const userId = req.user.userId;
+  const activeApplications = { userId, archivedAt: null };
+  const actionsFilter = {
+    ...activeApplications,
+    nextAction: { not: null },
+  };
+  const now = new Date();
 
-router.get("/dashboard", authMiddleware, async (req, res) => {
-  try {
-    const userId = req.user.userId;
-
-    const [statusCounts, companies, recentApplications] = await Promise.all([
+  const [
+    statusCounts,
+    companies,
+    recentApplications,
+    nextActions,
+    nextActionCount,
+    overdueActionCount,
+    unscheduledActionCount,
+  ] =
+    await Promise.all([
       prisma.application.groupBy({
         by: ["status"],
-        where: {
-          userId,
-        },
-        _count: {
-          id: true,
-        },
+        where: activeApplications,
+        _count: { id: true },
       }),
       prisma.company.findMany({
-        where: {
-          userId,
-        },
+        where: { userId },
         select: {
           id: true,
           name: true,
           _count: {
             select: {
-              applications: true,
+              applications: {
+                where: { archivedAt: null },
+              },
             },
           },
         },
       }),
       prisma.application.findMany({
-        where: {
-          userId,
-        },
+        where: activeApplications,
         orderBy: {
-          createdAt: "desc",
+          updatedAt: "desc",
         },
         take: 5,
         select: {
@@ -220,244 +224,199 @@ router.get("/dashboard", authMiddleware, async (req, res) => {
           },
         },
       }),
+      prisma.application.findMany({
+        where: actionsFilter,
+        orderBy: [
+          { nextActionAt: "asc" },
+          { updatedAt: "desc" },
+        ],
+        take: 12,
+        select: {
+          id: true,
+          title: true,
+          status: true,
+          nextAction: true,
+          nextActionAt: true,
+          company: {
+            select: {
+              id: true,
+              name: true,
+            },
+          },
+        },
+      }),
+      prisma.application.count({
+        where: actionsFilter,
+      }),
+      prisma.application.count({
+        where: {
+          ...actionsFilter,
+          nextActionAt: { lt: now },
+        },
+      }),
+      prisma.application.count({
+        where: {
+          ...actionsFilter,
+          nextActionAt: null,
+        },
+      }),
     ]);
 
-    const countsByStatus = Object.fromEntries(
-      allowedStatuses.map((status) => [status, 0])
+  const countsByStatus = Object.fromEntries(
+    applicationStatuses.map((status) => [status, 0]),
+  );
+
+  for (const item of statusCounts) {
+    countsByStatus[item.status] = item._count.id;
+  }
+
+  const applicationsPerCompany = companies
+    .map((company) => ({
+      companyId: company.id,
+      companyName: company.name,
+      count: company._count.applications,
+    }))
+    .filter((company) => company.count > 0)
+    .sort(
+      (first, second) =>
+        second.count - first.count ||
+        first.companyName.localeCompare(second.companyName),
     );
 
-    for (const item of statusCounts) {
-      countsByStatus[item.status] = item._count.id;
-    }
-
-    const applicationsPerCompany = companies
-      .map((company) => ({
-        companyId: company.id,
-        companyName: company.name,
-        count: company._count.applications,
-      }))
-      .filter((company) => company.count > 0)
-      .sort(
-        (a, b) =>
-          b.count - a.count || a.companyName.localeCompare(b.companyName)
-      );
-
-    return res.status(200).json({
-      totalApplications: statusCounts.reduce(
-        (total, item) => total + item._count.id,
-        0
-      ),
-      countsByStatus,
-      applicationsPerCompany,
-      recentApplications,
-    });
-  } catch (error) {
-    console.error("GET APPLICATION DASHBOARD ERROR:", error);
-
-    return res.status(500).json({
-      error: "Failed to fetch application dashboard",
-    });
-  }
+  return res.status(200).json({
+    totalApplications: statusCounts.reduce(
+      (total, item) => total + item._count.id,
+      0,
+    ),
+    countsByStatus,
+    applicationsPerCompany,
+    recentApplications,
+    nextActions,
+    nextActionCount,
+    overdueActionCount,
+    unscheduledActionCount,
+  });
 });
 
-router.get("/:id", authMiddleware, async (req, res) => {
-  try {
-    const applicationId = Number(req.params.id);
+router.post(
+  "/:id/archive",
+  validateParams(idParamsSchema),
+  async (req, res) => {
+    const applicationId = req.validatedParams.id;
+    await findOwnedApplication(applicationId, req.user.userId);
 
-    if (Number.isNaN(applicationId)) {
-      return res.status(400).json({
-        error: "Invalid application id",
-      });
-    }
-
-    const application = await prisma.application.findFirst({
-      where: {
-        id: applicationId,
-        userId: req.user.userId,
-      },
+    const application = await prisma.application.update({
+      where: { id: applicationId },
+      data: { archivedAt: new Date() },
     });
-
-    if (!application) {
-      return res.status(404).json({
-        error: "Application not found",
-      });
-    }
 
     return res.status(200).json(application);
-  } catch (error) {
-    console.error("GET APPLICATION BY ID ERROR:", error);
+  },
+);
 
-    return res.status(500).json({
-      error: "Failed to fetch application",
+router.post(
+  "/:id/restore",
+  validateParams(idParamsSchema),
+  async (req, res) => {
+    const applicationId = req.validatedParams.id;
+    await findOwnedApplication(applicationId, req.user.userId);
+
+    const application = await prisma.application.update({
+      where: { id: applicationId },
+      data: { archivedAt: null },
     });
+
+    return res.status(200).json(application);
+  },
+);
+
+router.get("/:id", validateParams(idParamsSchema), async (req, res) => {
+  const application = await prisma.application.findFirst({
+    where: {
+      id: req.validatedParams.id,
+      userId: req.user.userId,
+    },
+    include: {
+      company: {
+        select: { id: true, name: true },
+      },
+      statusHistory: {
+        orderBy: { changedAt: "desc" },
+        select: {
+          id: true,
+          fromStatus: true,
+          toStatus: true,
+          changedAt: true,
+        },
+      },
+    },
+  });
+
+  if (!application) {
+    throw notFound("Application not found");
   }
+
+  return res.status(200).json(application);
 });
 
-router.patch("/:id", authMiddleware, async (req, res) => {
-  try {
-    const applicationId = Number(req.params.id);
+router.patch(
+  "/:id",
+  validateParams(idParamsSchema),
+  validateBody(updateApplicationSchema),
+  async (req, res) => {
+    const applicationId = req.validatedParams.id;
+    const userId = req.user.userId;
+    const currentApplication = await findOwnedApplication(
+      applicationId,
+      userId,
+      { id: true, status: true },
+    );
+    const statusChanged =
+      req.validatedBody.status &&
+      req.validatedBody.status !== currentApplication.status;
 
-    if (Number.isNaN(applicationId)) {
-      return res.status(400).json({
-        error: "Invalid application id",
-      });
-    }
-
-    const { title, status, jobUrl, salary, appliedAt } = req.body;
-
-    const data = {};
-
-    if (title !== undefined) {
-      if (typeof title !== "string") {
-        return res.status(400).json({
-          error: "Title must be a string",
+    const updatedApplication = await prisma.$transaction(
+      async (transaction) => {
+        const application = await transaction.application.update({
+          where: { id: applicationId },
+          data: req.validatedBody,
+          include: {
+            company: {
+              select: { id: true, name: true },
+            },
+          },
         });
-      }
 
-      const normalizedTitle = title.trim();
-
-      if (!normalizedTitle) {
-        return res.status(400).json({
-          error: "Title cannot be empty",
-        });
-      }
-
-      data.title = normalizedTitle;
-    }
-
-    if (status !== undefined) {
-      if (typeof status !== "string") {
-        return res.status(400).json({
-          error: "Status must be a string",
-        });
-      }
-
-      if (!allowedStatuses.includes(status)) {
-        return res.status(400).json({
-          error: "Invalid application status",
-        });
-      }
-
-      data.status = status;
-    }
-
-    if (jobUrl !== undefined) {
-      if (typeof jobUrl !== "string") {
-        return res.status(400).json({
-          error: "Job URL must be a string",
-        });
-      }
-
-      data.jobUrl = jobUrl.trim() || null;
-    }
-
-    if (salary !== undefined) {
-      if (typeof salary !== "string") {
-        return res.status(400).json({
-          error: "Salary must be a string",
-        });
-      }
-
-      data.salary = salary.trim() || null;
-    }
-
-    if (appliedAt !== undefined) {
-      if (typeof appliedAt !== "string") {
-        return res.status(400).json({
-          error: "Applied date must be a string",
-        });
-      }
-
-      if (!appliedAt.trim()) {
-        data.appliedAt = null;
-      } else {
-        const parsedDate = new Date(appliedAt);
-
-        if (Number.isNaN(parsedDate.getTime())) {
-          return res.status(400).json({
-            error: "Invalid appliedAt date",
+        if (statusChanged) {
+          await transaction.applicationStatusHistory.create({
+            data: {
+              fromStatus: currentApplication.status,
+              toStatus: req.validatedBody.status,
+              userId,
+              applicationId,
+            },
           });
         }
 
-        data.appliedAt = parsedDate;
-      }
-    }
-
-    if (Object.keys(data).length === 0) {
-      return res.status(400).json({
-        error: "No fields to update",
-      });
-    }
-
-    const application = await prisma.application.findFirst({
-      where: {
-        id: applicationId,
-        userId: req.user.userId,
+        return application;
       },
-    });
-
-    if (!application) {
-      return res.status(404).json({
-        error: "Application not found",
-      });
-    }
-
-    const updatedApplication = await prisma.application.update({
-      where: {
-        id: applicationId,
-      },
-      data,
-    });
+    );
 
     return res.status(200).json(updatedApplication);
-  } catch (error) {
-    console.error("UPDATE APPLICATION ERROR:", error);
+  },
+);
 
-    return res.status(500).json({
-      error: "Failed to update application",
-    });
-  }
-});
+router.delete("/:id", validateParams(idParamsSchema), async (req, res) => {
+  const applicationId = req.validatedParams.id;
+  await findOwnedApplication(applicationId, req.user.userId);
 
-router.delete("/:id", authMiddleware, async (req, res) => {
-  try {
-    const applicationId = Number(req.params.id);
+  await prisma.application.delete({
+    where: { id: applicationId },
+  });
 
-    if (Number.isNaN(applicationId)) {
-      return res.status(400).json({
-        error: "Invalid application id",
-      });
-    }
-
-    const application = await prisma.application.findFirst({
-      where: {
-        id: applicationId,
-        userId: req.user.userId,
-      },
-    });
-
-    if (!application) {
-      return res.status(404).json({
-        error: "Application not found",
-      });
-    }
-
-    await prisma.application.delete({
-      where: {
-        id: applicationId,
-      },
-    });
-
-    return res.status(200).json({
-      message: "Application deleted successfully",
-    });
-  } catch (error) {
-    console.error("DELETE APPLICATION ERROR:", error);
-
-    return res.status(500).json({
-      error: "Failed to delete application",
-    });
-  }
+  return res.status(200).json({
+    message: "Application deleted successfully",
+  });
 });
 
 export default router;

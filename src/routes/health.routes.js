@@ -1,10 +1,11 @@
 import { Router } from "express";
+
 import prisma from "../lib/prisma.js";
 
 const router = Router();
 
 router.get("/", (req, res) => {
-  res.status(200).json({
+  return res.status(200).json({
     status: "ok",
   });
 });
@@ -17,10 +18,8 @@ router.get("/db", async (req, res) => {
       status: "ok",
       database: "connected",
     });
-  } catch (error) {
-    console.error("DATABASE HEALTH CHECK ERROR:", error);
-
-    return res.status(500).json({
+  } catch {
+    return res.status(503).json({
       status: "error",
       database: "unavailable",
     });

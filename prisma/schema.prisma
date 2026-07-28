@@ -21,14 +21,15 @@ enum ApplicationStatus {
 }
 
 model User {
-  id           Int           @id @default(autoincrement())
-  email        String        @unique
-  password     String
-  createdAt    DateTime      @default(now())
-  updatedAt    DateTime      @updatedAt
-  companies    Company[]
-  applications Application[]
-  notes        Note[]
+  id                    Int                        @id @default(autoincrement())
+  email                 String                     @unique
+  password              String
+  createdAt             DateTime                   @default(now())
+  updatedAt             DateTime                   @updatedAt
+  companies             Company[]
+  applications          Application[]
+  notes                 Note[]
+  applicationStatusLogs ApplicationStatusHistory[]
 }
 
 model Company {
@@ -45,21 +46,48 @@ model Company {
 }
 
 model Application {
-  id         Int               @id @default(autoincrement())
-  title      String
-  status     ApplicationStatus @default(wishlist)
-  jobUrl     String?
-  salary     String?
-  appliedAt  DateTime?
-  createdAt  DateTime          @default(now())
-  updatedAt  DateTime          @updatedAt
-  notes      Note[]
+  id            Int                        @id @default(autoincrement())
+  title         String
+  status        ApplicationStatus          @default(wishlist)
+  jobUrl        String?
+  salary        String?
+  appliedAt     DateTime?
+  nextAction    String?
+  nextActionAt  DateTime?
+  contactName   String?
+  contactEmail  String?
+  contactPhone  String?
+  source        String?
+  archivedAt    DateTime?
+  createdAt     DateTime                   @default(now())
+  updatedAt     DateTime                   @updatedAt
+  notes         Note[]
+  statusHistory ApplicationStatusHistory[]
 
-  userId     Int
-  user       User              @relation(fields: [userId], references: [id], onDelete: Cascade)
+  userId        Int
+  user          User                       @relation(fields: [userId], references: [id], onDelete: Cascade)
 
-  companyId  Int
-  company    Company           @relation(fields: [companyId], references: [id], onDelete: Cascade)
+  companyId     Int
+  company       Company                    @relation(fields: [companyId], references: [id], onDelete: Cascade)
+
+  @@index([userId, archivedAt, nextActionAt])
+  @@index([companyId])
+}
+
+model ApplicationStatusHistory {
+  id            Int               @id @default(autoincrement())
+  fromStatus    ApplicationStatus?
+  toStatus      ApplicationStatus
+  changedAt     DateTime          @default(now())
+
+  userId        Int
+  user          User              @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  applicationId Int
+  application   Application       @relation(fields: [applicationId], references: [id], onDelete: Cascade)
+
+  @@index([applicationId, changedAt])
+  @@index([userId])
 }
 
 model Note {
